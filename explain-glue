@@ -1,0 +1,1440 @@
+import sys
+import json
+import hashlib
+from datetime import datetime
+
+import boto3
+from botocore.exceptions import ClientError
+
+from pyspark.context import SparkContext
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
+
+# ============================================================
+# BLOCK 1 — IMPORTS
+# ============================================================
+# Three groups of imports:
+#
+# GROUP 1 — Python standard library (built into Python, no installation needed)
+#   sys      : access system things like command line arguments
+#   json     : read and write JSON files
+#   hashlib  : compute checksums (SHA-256) for the idempotency guard
+#   datetime : work with dates and timestamps throughout the pipeline
+#
+# GROUP 2 — AWS tools
+#   boto3       : official Python library for talking to AWS services (S3, Glue)
+#   ClientError : error raised by boto3 when an AWS call fails (e.g. file not found)
+#
+# GROUP 3 — Spark and Glue
+#   SparkContext     : starts the Spark engine — like turning on the car engine
+#   functions as F   : huge library of built-in Spark functions. Aliased to F so
+#                      we write F.col() instead of pyspark.sql.functions.col()
+#   Window           : used for the last-touch attribution window function
+#   GlueContext      : wraps SparkContext with AWS Glue-specific features
+#   Job              : represents this specific Glue job run
+#   getResolvedOptions: reads arguments passed to the job from outside (e.g. --input_key)
+# ============================================================
+
+
+# ============================================================
+# BLOCK 2 — CONFIGURATION CONSTANTS
+# ============================================================
+# All settings that might change are placed here at the top of the file
+# rather than scattered throughout the code.
+#
+# CONVENTION: UPPERCASE names signal "this is a constant — do not change
+# it during the program." It is a signal to other developers.
+#
+# BUCKET: the S3 bucket where all reads and writes happen.
+#
+# PREFIX constants: S3 has no real folders — everything is a file with a long
+# name. We use slashes to simulate folder structure:
+#   processed/2026/03/17/2026-03-17_SearchKeywordPerformance.tab
+#   logs/2026/03/17/run-summary-2026-03-17-14-30-00.json
+#
+# SEARCH_ENGINE_PATTERNS: domain fragments to look for in the referrer URL.
+#   If someone came from "www.google.com/search?q=ipod" the word "google."
+#   is in the URL so we know it is a Google search.
+#   NOTE: we use "google." with a dot — not just "google" — to avoid accidentally
+#   matching a site called "mygoogle.com".
+#
+# KEYWORD_PARAMS: Yahoo uses a different URL parameter for the search keyword.
+#   Everyone else uses q=keyword in the URL. Yahoo uses p=keyword.
+#
+# ⚠ LIMITATION / IMPROVEMENT:
+#   These patterns are hardcoded. To add a new search engine you must edit
+#   the code and redeploy the Glue job. A better design would read these from
+#   metadata_config.json so non-developers can update them without touching code.
+# ============================================================
+BUCKET = "analytics-hitdata-s3"
+PROCESSED_PREFIX = "processed/"
+METADATA_PREFIX = "metadata/"
+LOGS_PREFIX = "logs/"
+CHECKSUMS_PREFIX = "checksums/"
+CONFIG_FILE = "metadata_config.json"
+
+# Search engines that should be detected from the referrer.
+# Add entries here to extend coverage without touching business logic.
+# ⚠ IMPROVEMENT: move this list to metadata_config.json so it can be
+#   updated without a code change and redeployment.
+SEARCH_ENGINE_PATTERNS = [
+    "google.",
+    "bing.",
+    "search.yahoo.",
+    "yahoo.",
+    "search.msn.",
+    "msn.",
+    "duckduckgo.",
+    "ask.",
+]
+
+# Query-string parameter names used by each engine family to carry the keyword.
+# Checked in order; first match wins.
+# NOTE: KEYWORD_PARAMS is defined here but is only used implicitly inside
+# _build_keyword_column() via hardcoded "yahoo." check. The dict is currently
+# not iterated — it serves as documentation of the design intent.
+KEYWORD_PARAMS = {
+    "yahoo.": "p",     # Yahoo uses p=
+    "default": "q",    # Google, Bing, MSN, DDG, Ask all use q=
+}
+
+
+# ============================================================
+# BLOCK 3 — JOB ARGUMENTS
+# ============================================================
+# When AWS runs the Glue job it passes information through arguments —
+# like telling the job which file to process. Think of it like calling
+# a function with parameters.
+#
+# getResolvedOptions reads two REQUIRED arguments:
+#   JOB_NAME  : Glue injects this automatically — the name of the job
+#   input_key : the S3 path of the file to process e.g. raw/2026/03/17/data.tab
+#
+# WHY NOT HARDCODE THE FILE PATH?
+#   The same job should work for any file on any date. Today it processes
+#   March 17's file. Tomorrow March 18's. Only the argument changes.
+#
+# --force is handled separately because getResolvedOptions raises an
+# exception if you ask for an argument that was not passed. Since --force
+# is optional we inspect sys.argv (the raw argument list) directly.
+#
+# _flag() accepts three valid forms:
+#   --force          (bare flag — presence alone means true)
+#   --force true     (explicit true)
+#   --force True     (capital T also accepted)
+#
+# ⚠ LIMITATION:
+#   argv.index(name) finds only the FIRST occurrence of --force.
+#   If someone accidentally passes it twice, the second is ignored.
+#   Fine for now but worth knowing.
+#
+# ⚠ IMPROVEMENT (from code review):
+#   --input_key should have NO default value in the Glue job config.
+#   Forcing the caller to always provide it makes the pipeline explicit
+#   and prevents accidentally reprocessing a stale hardcoded file.
+# ============================================================
+args = getResolvedOptions(sys.argv, ["JOB_NAME", "input_key"])
+JOB_NAME  = args["JOB_NAME"]
+INPUT_KEY = args["input_key"]
+
+# --force is optional; getResolvedOptions raises if a key is missing so
+# we inspect sys.argv directly.  Accepted forms:
+#   --force          (presence alone means true)
+#   --force true
+#   --force True
+def _flag(argv, name):
+    if name not in argv:
+        return False
+    idx = argv.index(name)
+    # If the next token exists and is not another flag, treat it as the value
+    if idx + 1 < len(argv) and not argv[idx + 1].startswith("--"):
+        return argv[idx + 1].strip().lower() == "true"
+    return True  # bare flag with no value
+
+FORCE_REPROCESS = _flag(sys.argv, "--force")
+
+
+# ============================================================
+# BLOCK 4 — GLUE / SPARK SETUP
+# ============================================================
+# This is the startup sequence — like turning on and configuring all
+# equipment before starting work.
+#
+# SparkContext    : starts the Spark engine. Connects the driver (main program
+#                  on the Glue master node) to the workers (machines that
+#                  process data in parallel).
+#
+# GlueContext     : wraps SparkContext with Glue-specific features like better
+#                  S3 integration and job bookmarks.
+#
+# spark           : the main object used to read data, run transformations,
+#                  and write output. Almost everything in Spark goes through this.
+#
+# job.init()      : tells Glue "this run has officially started." Glue tracks
+#                  job runs and this is the signal that work is beginning.
+#
+# s3 boto3 client : creates a client for direct S3 access. Even though Spark
+#                  can read from S3, we also need direct S3 for things like
+#                  the checksum check, writing JSON logs, and deleting temp files.
+#
+# session.timeZone = UTC : tells Spark to treat all timestamps as UTC.
+#   Without this, timestamps could be interpreted differently depending on
+#   which AWS region the workers are in, causing subtle timezone bugs.
+#
+# shuffle.partitions = 200 : when Spark does joins or aggregations it
+#   redistributes data across workers (a "shuffle"). This controls how many
+#   pieces it splits into. 200 is the Spark default.
+#
+# ⚠ IMPROVEMENT:
+#   200 is hardcoded. It is too high for small files (your 21-row sample
+#   would create 200 nearly-empty partitions, wasting overhead). It could
+#   be too low for very large files. Make this a job argument so it can be
+#   tuned per file size:
+#       --shuffle_partitions 50    (small files)
+#       --shuffle_partitions 500   (large files)
+# ============================================================
+sc = SparkContext()
+glue_context = GlueContext(sc)
+spark = glue_context.spark_session
+job = Job(glue_context)
+job.init(JOB_NAME, args)
+
+s3 = boto3.client("s3")
+
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+spark.conf.set("spark.sql.shuffle.partitions", "200")  # ⚠ hardcoded — see note above
+
+
+# ============================================================
+# BLOCK 5 — PIPELINE LOGGER AND S3 UPLOAD HELPERS
+# ============================================================
+# PIPELINE_LOG_LINES: a Python list that collects every log message during
+#   the run. Think of it as a notepad accumulating entries as the job runs.
+#
+# log(): every time something important happens we call log("message").
+#   It does TWO things simultaneously:
+#     print(line)                     → goes to CloudWatch in real time
+#     PIPELINE_LOG_LINES.append(line) → saved for writing to S3 at the end
+#   This dual approach gives live visibility during the run AND a permanent
+#   record in S3 after completion.
+#
+# upload_json(): writes a Python dictionary to S3 as a formatted JSON file.
+#   json.dumps(payload, indent=2) converts the dict to a human-readable string.
+#   .encode("utf-8") converts that string to bytes (S3 stores bytes not strings).
+#
+# upload_text(): same idea but for plain text (used for the pipeline log file).
+#
+# ⚠ IMPROVEMENT (Python 3.12 deprecation):
+#   datetime.utcnow() is deprecated. It returns a "naive" datetime — no
+#   timezone information is attached even though it conceptually represents UTC.
+#   This can cause silent timezone conversion errors when other systems consume
+#   these timestamps.
+#   FIX: replace all datetime.utcnow() with datetime.now(timezone.utc)
+#   and add timezone to the import:
+#       from datetime import datetime, timezone
+#   The output changes from:
+#       "2026-03-17T14:30:00.123456"         (no timezone — ambiguous)
+#   to:
+#       "2026-03-17T14:30:00.123456+00:00"   (explicit UTC — unambiguous)
+# ============================================================
+PIPELINE_LOG_LINES = []
+
+
+def log(message: str) -> None:
+    # ⚠ datetime.utcnow() deprecated in Python 3.12
+    # FIX: use datetime.now(timezone.utc).isoformat()
+    line = f"{datetime.utcnow().isoformat()} INFO {message}"
+    PIPELINE_LOG_LINES.append(line)
+    print(line)  # → CloudWatch (real-time)
+
+
+def upload_json(key: str, payload: dict) -> None:
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=key,
+        Body=json.dumps(payload, indent=2).encode("utf-8"),
+        ContentType="application/json"
+    )
+
+
+def upload_text(key: str, text: str) -> None:
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=key,
+        Body=text.encode("utf-8"),
+        ContentType="text/plain"
+    )
+
+
+# ============================================================
+# BLOCK 6 — HELPER FUNCTIONS
+# ============================================================
+
+def load_metadata_config(file_name: str) -> dict:
+    """
+    Read the JSON config from the local Glue runtime filesystem.
+
+    WHY LOCAL FILESYSTEM?
+    Glue copies --extra-files to the working directory of the driver node
+    automatically before the job starts. A plain open() is simpler and faster
+    than an S3 API call. The comment below shows how to swap to S3 if needed.
+
+    To read from S3 instead, swap for:
+        obj = s3.get_object(Bucket=BUCKET, Key=<s3_key>)
+        return json.loads(obj["Body"].read())
+
+    ⚠ NOTE (from Glue job config review):
+    The job config uses "referencedPath" for metadata_config.json but the
+    script comment says --extra-files. These are different mechanisms:
+      referencedPath : marks the file as a dependency for display purposes only
+                       — does NOT copy it to the worker filesystem
+      --extra-files  : actually copies the file to the worker filesystem
+    Verify which one is active and make them consistent.
+    """
+    with open(file_name, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def compute_checksum(bucket: str, key: str) -> str:
+    """
+    Stream the S3 object in 8 MB chunks and return its SHA-256 hex digest.
+
+    WHY STREAM INSTEAD OF LOADING THE WHOLE FILE?
+    Files can be 10+ GB. Loading the whole file into driver memory causes OOM.
+    Streaming keeps memory usage constant at 8 MB regardless of file size:
+        File: 10 GB → memory used: always 8 MB ✓
+        File: 100 GB → memory used: always 8 MB ✓
+
+    THE STREAMING PATTERN:
+        iter(lambda: obj["Body"].read(8 * 1024 * 1024), b"")
+    This is a Python trick. iter(callable, sentinel) keeps calling the lambda
+    until it returns the sentinel value (b"" = empty bytes). So it reads 8 MB,
+    feeds it to the hasher, reads the next 8 MB, and so on until the file ends.
+
+    WHY "from e" IN THE EXCEPT?
+    Preserves the original AWS error as the cause when re-raising. Makes
+    debugging easier because you see both the original error and the new message.
+
+    ⚠ LIMITATION:
+    build_s3_keys() which calls this function is outside the main try/except
+    block. If this function raises, no FAILED summary is written to S3.
+    """
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+    except ClientError as e:
+        raise ValueError(f"S3 source file not found: s3://{bucket}/{key}") from e
+
+    hasher = hashlib.sha256()
+    for chunk in iter(lambda: obj["Body"].read(8 * 1024 * 1024), b""):
+        hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def checksum_exists(checksum_key: str) -> bool:
+    """
+    Return True if a checksum record already exists in S3 (idempotency guard).
+
+    WHY head_object INSTEAD OF get_object?
+    head_object is a metadata-only call — it asks "does this file exist and
+    how big is it?" without downloading any content. Much cheaper than reading
+    the file, especially called on every single pipeline run.
+
+    WHY THREE ERROR CODES FOR "NOT FOUND"?
+    AWS is inconsistent. Different S3 operations return different codes for
+    the same "file doesn't exist" situation:
+        404         : standard HTTP not found
+        NoSuchKey   : S3-specific not found
+        NotFound    : returned by certain S3 configurations
+    Catching all three makes the code robust across different AWS environments.
+
+    WHY bare "raise" AT THE END?
+    If it is a different error (permissions denied, network error, etc.) we do
+    not silently swallow it. Re-raising it lets the job fail loudly rather than
+    incorrectly returning False and allowing a duplicate run to proceed.
+    """
+    try:
+        s3.head_object(Bucket=BUCKET, Key=checksum_key)
+        return True
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise  # unexpected error — re-raise, do not mask it
+
+
+def consolidate_output(temp_prefix: str, final_key: str) -> None:
+    """
+    Spark writes output as a directory of part files. For the required
+    single-file naming convention this helper copies the sole part file
+    to the named destination and removes the temp directory.
+
+    WHY COPY THEN DELETE INSTEAD OF RENAME?
+    S3 has no rename operation. Moving a file in S3 is always a copy
+    followed by a delete. This is an S3 fundamental constraint.
+
+    WHY A PAGINATOR INSTEAD OF list_objects_v2 DIRECTLY?
+    S3 list_objects_v2 returns at most 1000 objects per API call. If the
+    temp folder somehow has more than 1000 files (e.g. after a failed run
+    left debris), a single call would miss the rest. The paginator
+    automatically makes as many API calls as needed to list everything.
+
+    ⚠ LIMITATION:
+    If someone manually placed a file in the temp prefix folder before the job
+    ran, the next() call finds the first file with "part-" in the name. If no
+    such file exists (all manual files have different names) the job raises
+    ValueError. The fix is to add a pre-flight check that the temp prefix is
+    empty before Spark writes to it.
+
+    ⚠ LIMITATION:
+    If the final_key already exists (e.g. manually placed file, or same-day
+    re-run without --force), copy_object silently overwrites it with no warning.
+    IMPROVEMENT: add a head_object check before copy and log a WARNING if the
+    output key already exists.
+
+    Scalability note:
+        coalesce(1) forces all data through one executor before writing,
+        which is acceptable for files up to ~1-2 GB.  For 10 GB+ files
+        the recommended approach is to write partitioned output and use
+        an S3 Batch Operation (or a post-processing Lambda) to rename/
+        merge the parts, avoiding the single-executor bottleneck entirely.
+    """
+    paginator = s3.get_paginator("list_objects_v2")
+    objects = []
+
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=temp_prefix):
+        objects.extend(page.get("Contents", []))
+
+    part_key = next(
+        (obj["Key"] for obj in objects if "part-" in obj["Key"]),
+        None
+    )
+
+    if not part_key:
+        raise ValueError(f"No Spark part file found under s3://{BUCKET}/{temp_prefix}")
+
+    s3.copy_object(
+        Bucket=BUCKET,
+        CopySource={"Bucket": BUCKET, "Key": part_key},
+        Key=final_key
+    )
+
+    # Delete ALL objects in temp prefix (part file + _SUCCESS + .crc files)
+    delete_items = [{"Key": obj["Key"]} for obj in objects]
+    if delete_items:
+        s3.delete_objects(Bucket=BUCKET, Delete={"Objects": delete_items})
+
+
+def build_s3_keys(input_key: str) -> dict:
+    """
+    Derive all output S3 keys for this pipeline run.
+
+    WHY ONE datetime.utcnow() CALL FOR EVERYTHING?
+    If you called datetime.utcnow() separately for each path and the clock
+    ticked from 14:30:59 to 14:31:00 between calls, your run summary would
+    land in a different path than your pipeline log. One call guarantees all
+    paths are consistent for the entire run.
+
+    WHY IS THIS CALLED BEFORE main()?
+    If called inside main() AND the error handler called it again, a new
+    timestamp would be generated and the FAILED summary would land in
+    completely different S3 paths than the ones main() was using. You would
+    never be able to find your error logs.
+    By calling it once here and passing _run_keys into main(), both main()
+    and the error handler always use the exact same paths.
+
+    ⚠ LIMITATION:
+    This function is called OUTSIDE the try/except block at the entry point.
+    If build_s3_keys() itself raises an exception (e.g. if someone later adds
+    an S3 call or config read inside it), no FAILED summary is written to S3
+    because the error handler has not been set up yet.
+    IMPROVEMENT: wrap the entire entry point (including this call) in try/except.
+
+    Output folder structure
+    -----------------------
+    The processed output always lands under a date-partitioned path built
+    from the current UTC run date so the processed/ folder is always
+    populated regardless of how the input key is structured:
+
+        processed/YYYY/MM/DD/YYYY-MM-DD_SearchKeywordPerformance.tab
+
+    Logs and metadata follow the same date partition so all artifacts for
+    a given day are co-located:
+
+        logs/YYYY/MM/DD/run-summary-YYYY-MM-DD-HH-MM-SS.json
+        logs/YYYY/MM/DD/pipeline-YYYY-MM-DD-HH-MM-SS.log
+        metadata/YYYY/MM/DD/metadata-log-YYYY-MM-DD-HH-MM-SS.json
+
+    Every file carries the full run timestamp so multiple executions on
+    the same day never overwrite each other.
+    """
+    # ⚠ datetime.utcnow() deprecated in Python 3.12
+    # FIX: use datetime.now(timezone.utc)
+    now = datetime.utcnow()
+    current_date = now.strftime("%Y-%m-%d")
+    current_ts   = now.strftime("%Y-%m-%d-%H-%M-%S")
+
+    # Date-partitioned folder: YYYY/MM/DD
+    date_path = now.strftime("%Y/%m/%d")
+
+    return {
+        "date_path":          date_path,
+        "metadata_key":       f"{METADATA_PREFIX}{date_path}/metadata-log-{current_ts}.json",
+        "summary_key":        f"{LOGS_PREFIX}{date_path}/run-summary-{current_ts}.json",
+        "pipeline_log_key":   f"{LOGS_PREFIX}{date_path}/pipeline-{current_ts}.log",
+        "output_key":         f"{PROCESSED_PREFIX}{date_path}/{current_date}_SearchKeywordPerformance.tab",
+        "temp_output_prefix": f"{PROCESSED_PREFIX}{date_path}/_tmp_output_{current_ts}/",
+    }
+
+
+# ============================================================
+# BLOCK 7 — METADATA PROFILER CLASS
+# ============================================================
+# WHAT THIS CLASS DOES IN PLAIN ENGLISH:
+# Before processing the data, we validate that the file looks like what we
+# expected. Are all the right columns there? In the right order?
+# Then we compute statistics about every column (min, max, nulls, distinct).
+#
+# WHY A CLASS INSTEAD OF FUNCTIONS?
+# The expected column config (expected_names, expected_defs) is loaded once
+# in __init__ and reused in every method call. Using a class means we don't
+# have to pass the config around as function arguments everywhere.
+# ============================================================
+class MetadataProfiler:
+    """
+    Profiles delimited text source metadata using Spark aggregations.
+
+    Supported expected_columns config formats:
+        1) ["col1", "col2", "col3"]
+        2) [{"name": "col1", "type": "int"}, {"name": "col2", "type": "datetime"}]
+
+    Because the source file is read as raw text, all actual values are
+    treated as strings.  Expected types come from config only and are
+    reported alongside the profiled type for downstream validation.
+
+    Performance:
+        - Min/max/null stats are computed in a single distributed agg pass.
+        - Distinct counts are computed in a second pass (Spark cannot fuse
+          countDistinct with other agg expressions on very large datasets).
+        - Both passes use collect()[0] which is safe because aggregation
+          reduces the result to a single row regardless of source size.
+        - No Python UDFs are used; all logic runs natively in Spark.
+    """
+
+    def __init__(self, expected_columns: list):
+        # expected_columns or [] guards against None being passed in
+        self.expected_columns = expected_columns or []
+        self.expected_names: list = []  # ordered list of column names
+        self.expected_defs: dict = {}   # name → {"type": "int"} mapping
+
+        # Handle both config formats:
+        #   Format 1: ["col1", "col2"]               → plain string
+        #   Format 2: [{"name": "col1", "type": "int"}] → dict with metadata
+        for col in self.expected_columns:
+            if isinstance(col, str):
+                self.expected_names.append(col)
+                self.expected_defs[col] = {"type": "string"}  # no type info → default string
+            elif isinstance(col, dict) and col.get("name"):
+                name = col["name"]
+                self.expected_names.append(name)
+                self.expected_defs[name] = {"type": col.get("type", "string")}
+
+    def _detect_mismatches(self, columns: list) -> list:
+        """
+        Compare actual columns against the expected schema definition.
+
+        CHECKS FOUR SEPARATE THINGS:
+        1. missing_columns    : expected "product_list" but it is not there
+        2. extra_columns      : file has a "new_column" we did not expect
+        3. column_count_mismatch : expected 12 columns, got 11
+        4. column_order_mismatch : all columns present but in wrong order
+
+        WHY CHECK ORDER?
+        A file could have all 12 correct columns but "referrer" in position 3
+        instead of position 11. Downstream systems that read positionally
+        (not by name) would silently get the wrong data.
+
+        ⚠ DESIGN CHOICE:
+        Mismatches are logged as warnings but do NOT halt the pipeline.
+        For strict data quality requirements you might want to raise an
+        exception here and stop processing rather than continuing with
+        potentially wrong data.
+        """
+        if not self.expected_names:
+            return []  # no config provided — nothing to compare against
+
+        mismatches = []
+        missing = [c for c in self.expected_names if c not in columns]
+        extra   = [c for c in columns if c not in self.expected_names]
+
+        if missing:
+            mismatches.append({"type": "missing_columns", "columns": missing})
+        if extra:
+            mismatches.append({"type": "extra_columns", "columns": extra})
+        if len(columns) != len(self.expected_names):
+            mismatches.append({
+                "type": "column_count_mismatch",
+                "expected": len(self.expected_names),
+                "actual": len(columns),
+            })
+        if list(columns) != self.expected_names:
+            mismatches.append({
+                "type": "column_order_mismatch",
+                "expected_order": self.expected_names,
+                "actual_order": list(columns),
+            })
+
+        return mismatches
+
+    def profile(self, df, source_key: str) -> dict:
+        """
+        Run distributed aggregations over df and return a metadata report dict.
+
+        WHY TWO SEPARATE AGGREGATION PASSES?
+        Spark cannot efficiently combine countDistinct with other aggregations
+        on large datasets in a single action. Two separate passes is the
+        recommended pattern. Both passes use collect()[0] which is safe because
+        aggregation always reduces to a single row regardless of source size.
+        No data is collected to the driver — only the one-row summary.
+
+        THE NULL CHECK:
+            F.col(col_name).isNull() | (F.trim(F.col(col_name)) == "")
+        Counts both actual nulls AND empty strings as null. In real data,
+        missing values often arrive as empty strings rather than proper nulls.
+
+        ⚠ LIMITATION / IMPROVEMENT:
+        df.count() is called here AND in main() before calling profile().
+        That means the source DataFrame is scanned twice just for the row count.
+        FIX: pass source_row_count as a parameter to profile() and remove
+        the df.count() call from inside this method.
+
+        The caller is responsible for caching df before calling this method
+        if the DataFrame will be reused afterward.
+        """
+        columns    = df.columns
+        # ⚠ REDUNDANT: main() already called df.count() — this is a second scan
+        #   FIX: accept total_rows as a parameter instead
+        total_rows = df.count()
+
+        mismatches = self._detect_mismatches(columns)
+
+        # --- Pass 1: min / max / null counts (single action) ---
+        # Build all aggregation expressions dynamically for every column.
+        # This runs as ONE distributed Spark action regardless of how many
+        # columns the file has — efficient at any scale.
+        agg_exprs = []
+        for col_name in columns:
+            agg_exprs.extend([
+                F.min(F.col(col_name)).alias(f"{col_name}__min"),
+                F.max(F.col(col_name)).alias(f"{col_name}__max"),
+                F.sum(
+                    F.when(
+                        # Count nulls AND empty/whitespace-only strings as missing
+                        F.col(col_name).isNull() | (F.trim(F.col(col_name)) == ""),
+                        1
+                    ).otherwise(0)
+                ).alias(f"{col_name}__nulls"),
+            ])
+
+        # collect()[0] is safe — aggregation always returns exactly one row
+        stats_row = df.agg(*agg_exprs).collect()[0].asDict()
+
+        # --- Pass 2: distinct counts (separate pass required by Spark) ---
+        # countDistinct cannot be fused with other agg functions efficiently.
+        # A second separate action is the correct and recommended pattern.
+        distinct_exprs = [
+            F.countDistinct(F.col(col_name)).alias(col_name)
+            for col_name in columns
+        ]
+        distinct_row = df.agg(*distinct_exprs).collect()[0].asDict()
+
+        profiles = [
+            {
+                "column_name": col_name,
+                "actual_profiled_data_type": "string",  # always string — file read as raw text
+                "expected_data_type": self.expected_defs.get(col_name, {}).get("type", "string"),
+                "min_value": stats_row.get(f"{col_name}__min"),
+                "max_value": stats_row.get(f"{col_name}__max"),
+                "total_nulls": int(stats_row.get(f"{col_name}__nulls", 0)),
+                "total_unique_values": int(distinct_row.get(col_name, 0)),
+            }
+            for col_name in columns
+        ]
+
+        return {
+            "source_bucket": BUCKET,
+            "source_key": source_key,
+            # ⚠ datetime.utcnow() deprecated — FIX: datetime.now(timezone.utc).isoformat()
+            "profiled_at_utc": datetime.utcnow().isoformat(),
+            "file_type": "delimited_text",
+            "delimiter": "\t",
+            "number_of_columns": len(columns),
+            "column_names": list(columns),
+            "total_rows": total_rows,
+            "metadata_mismatch": len(mismatches) > 0,
+            "metadata_mismatch_details": mismatches,
+            "columns": profiles,
+        }
+
+
+# ============================================================
+# BLOCK 8 — BUSINESS PROCESSOR CLASS
+# ============================================================
+# WHAT THIS CLASS DOES IN PLAIN ENGLISH:
+# Answers the question: "Which search keywords drive the most revenue?"
+#
+# It does this through last-touch attribution:
+#   1. Find every row where someone arrived via a search engine (touchpoints)
+#   2. Find every row where someone made a purchase
+#   3. For each purchase, find the most recent search touchpoint from the same IP
+#   4. Give 100% of that purchase's revenue credit to that keyword
+#   5. Add up all revenue per keyword and sort highest first
+#
+# WHY A CLASS INSTEAD OF FUNCTIONS?
+# This class has no state — __init__ does nothing. The static methods could
+# be plain functions. They are grouped inside a class purely for organisation
+# and to satisfy the assessment requirement for "at least one class."
+# In a larger system, this class would be one of several processors
+# (e.g. PaidAdsProcessor, EmailCampaignProcessor) all sharing a common
+# transform() interface — that is where classes add real value (polymorphism).
+# ============================================================
+class SearchKeywordRevenueProcessor:
+    """
+    Answers the client business question:
+
+        How much revenue is the client getting from external Search Engines
+        (Google, Yahoo, Bing/MSN, etc.) and which keywords are performing
+        the best based on revenue?
+
+    Attribution logic (last-touch, per-session):
+        1. Identify rows where the referrer is a known external search engine
+           and extract the search keyword from the query string.
+        2. Identify rows where event_list contains event code "1" (Purchase)
+           and extract revenue from product_list (4th semicolon-delimited
+           field per product, summed across all products in the row).
+        3. For each purchase, attribute it to the most recent search engine
+           referral from the same IP address that occurred before the purchase.
+        4. Aggregate total revenue by (search_engine_domain, search_keyword)
+           and return results sorted descending by revenue.
+
+    Performance notes:
+        - All transformations use native Spark/SQL functions (no Python UDFs)
+          so the full computation runs distributed across the cluster.
+        - Revenue extraction uses Spark's aggregate() higher-order function,
+          which avoids explode()+groupBy overhead for the product_list column.
+        - The Window function for last-touch attribution partitions by
+          (ip, purchase_time, revenue) which limits shuffle size.
+        - df is expected to already be cached by the caller.
+    """
+
+    # Mirror the module-level constant so the class is self-contained
+    # and could be imported independently if needed.
+    SEARCH_ENGINE_PATTERNS = SEARCH_ENGINE_PATTERNS
+
+    def __init__(self):
+        # No instance state needed — all config comes from module-level constants.
+        # The class is here for organisation and extensibility (polymorphism),
+        # not because it needs object state.
+        pass
+
+    @staticmethod
+    def _build_search_engine_column(df):
+        """
+        Identify external search engine domain from the lowercased referrer.
+        Returns df with a new 'search_engine_domain' column (null if not a
+        recognised search engine).
+
+        HOW IT WORKS:
+        Chains Spark F.when() expressions — like a series of if/elif checks:
+            if referrer_domain contains "google."  → search_engine_domain = referrer_domain
+            elif contains "bing."                  → search_engine_domain = referrer_domain
+            elif contains "yahoo."                 → search_engine_domain = referrer_domain
+            ...
+            else                                   → search_engine_domain = null (not a search engine)
+
+        WHY store the full domain instead of the pattern?
+        Preserves distinction between "www.google.com", "google.co.uk" etc.
+        which is useful for regional analysis.
+
+        @staticmethod: this method does not use self. It takes a DataFrame
+        and returns a DataFrame. It is inside the class purely for organisation.
+
+        ⚠ BUG / DEAD CODE:
+        There are TWO loops in this method. The FIRST loop builds a variable
+        called "condition" which is NEVER USED anywhere after it is built.
+        It is leftover dead code from an earlier version of this function.
+        The SECOND loop builds "expr" which is the one actually used.
+        The first loop should be deleted entirely — it wastes CPU building
+        an object that is immediately discarded.
+
+        IMPROVEMENT: delete lines from "condition = None" through the first
+        "for pattern in SEARCH_ENGINE_PATTERNS" loop.
+        """
+        # ⚠ DEAD CODE — this entire block builds "condition" which is never used
+        # DELETE this first loop
+        condition = None
+        for pattern in SEARCH_ENGINE_PATTERNS:
+            clause = F.when(
+                F.col("referrer_domain").contains(pattern),
+                F.col("referrer_domain")
+            )
+            condition = clause if condition is None else condition.when(
+                F.col("referrer_domain").contains(pattern),
+                F.col("referrer_domain")
+            )
+        # ⚠ END OF DEAD CODE
+
+        # This second loop is the WORKING implementation — keep this one
+        expr = F.when(F.col("referrer_domain").contains(SEARCH_ENGINE_PATTERNS[0]),
+                      F.col("referrer_domain"))
+        for pattern in SEARCH_ENGINE_PATTERNS[1:]:
+            expr = expr.when(F.col("referrer_domain").contains(pattern),
+                             F.col("referrer_domain"))
+        # If none of the patterns match, expr returns null automatically
+        # which signals "not a search engine referral"
+
+        return df.withColumn("search_engine_domain", expr)
+
+    @staticmethod
+    def _build_keyword_column(df):
+        """
+        Extract the search keyword from the referrer query string.
+
+        HOW SEARCH URLS LOOK:
+            Google: https://www.google.com/search?q=ipod+nano&source=hp
+                                                  ↑ q= is the keyword parameter
+            Yahoo:  https://search.yahoo.com/search?p=zune+player
+                                                     ↑ Yahoo uses p= not q=
+
+        THE REGEX [?&]q=([^&]+):
+            [?&]     : the character before q= must be ? (first param) or & (subsequent)
+            q=       : literal text
+            ([^&]+)  : capture everything until the next & or end of string
+            The "1" at the end of regexp_extract means return the first captured group
+
+        URL DECODING:
+            In URLs, spaces are encoded as + so "ipod nano" arrives as "ipod+nano"
+            regexp_replace(keyword_raw, r"\\+", " ") converts + back to space
+
+        ⚠ LIMITATION:
+        Only the + character is decoded. Full URL percent-encoding like:
+            %20 (space), %2B (literal plus), %26 (ampersand)
+        is NOT handled. Keywords with these characters will appear raw in the output.
+        IMPROVEMENT: apply full URL decoding using a Spark UDF with Python's
+        urllib.parse.unquote_plus, or use regexp_replace for common cases.
+
+        @staticmethod: no instance state needed — pure function grouped for organisation.
+        """
+        keyword_raw = (
+            F.when(
+                F.col("referrer_domain").contains("yahoo."),
+                # Yahoo uses p= parameter
+                F.regexp_extract(F.col("referrer_lc"), r"[?&]p=([^&]+)", 1)
+            ).otherwise(
+                # All other search engines use q= parameter
+                F.regexp_extract(F.col("referrer_lc"), r"[?&]q=([^&]+)", 1)
+            )
+        )
+
+        # Only set search_keyword if something was actually extracted
+        # (regexp_extract returns "" when no match — we treat that as null)
+        # Also: lowercase everything and decode + as space
+        keyword = F.when(
+            F.trim(keyword_raw) != "",
+            F.lower(F.regexp_replace(keyword_raw, r"\+", " "))
+        )
+        # If keyword_raw is empty string, keyword is null
+        # (F.when with no .otherwise() returns null by default)
+
+        return df.withColumn("search_keyword", keyword)
+
+    @staticmethod
+    def _build_revenue_column(df):
+        """
+        Sum revenue across all products in product_list.
+
+        WHAT PRODUCT_LIST LOOKS LIKE:
+            "Electronics;iPod Nano;1;299.00;event1;evar1,Accessories;Case;1;29.99;;"
+              ↑category   ↑name    ↑qty ↑revenue                    ↑second product
+            Comma separates products. Semicolons separate fields within each product.
+            Revenue is always the 4th field (1-indexed).
+
+        WALKING THROUGH THE aggregate() EXPRESSION:
+            coalesce(product_list, '')        → if null, use empty string
+            split(..., ',')                   → ["Electronics;iPod;1;299.00;...", "Accessories;..."]
+            filter(array, x -> ...)           → remove empty entries
+            aggregate(array, 0.0, ...)        → fold: start at 0.0, add each product's revenue
+            element_at(split(x, ';'), 4)      → get 4th semicolon field = revenue
+            try_cast(... as double)           → convert to number, return null if not numeric
+            coalesce(..., 0.0)                → if null (bad/missing data) use 0
+
+        WHY aggregate() INSTEAD OF explode() + groupBy()?
+        explode() creates a new row for each product — a customer buying 5 products
+        creates 5 rows, then you need another groupBy to collapse them back.
+        aggregate() does the whole thing in ONE expression without creating extra rows.
+        Faster and simpler — especially on large datasets with many products per row.
+
+        @staticmethod: no instance state needed — pure function grouped for organisation.
+        """
+        return df.withColumn(
+            "revenue",
+            F.expr("""
+                aggregate(
+                    filter(
+                        split(coalesce(product_list, ''), ','),
+                        x -> x is not null and trim(x) <> ''
+                    ),
+                    cast(0.0 as double),
+                    (acc, x) -> acc + coalesce(
+                        try_cast(element_at(split(x, ';'), 4) as double),
+                        0.0
+                    )
+                )
+            """)
+        )
+
+    def transform(self, df):
+        """
+        Execute the full search keyword revenue attribution pipeline.
+
+        OVERVIEW OF WHAT HAPPENS:
+        1. Guard: check required columns exist — fail fast with a clear error
+        2. Enrich: add derived columns (timestamp, domain, engine, keyword, purchase flag, revenue)
+        3. Cache: store enriched df in memory — used by both branches below
+        4. Branch A: filter to search touchpoints (rows from search engines)
+        5. Branch B: filter to purchases (rows with event "1" and revenue > 0)
+        6. Join: for each purchase find all touchpoints from same IP before purchase time
+        7. Window: pick most recent touchpoint per purchase (last-touch attribution)
+        8. Aggregate: sum revenue by domain + keyword, sort descending
+        9. Finally: always unpersist enriched cache even if an exception occurs
+
+        Parameters
+        ----------
+        df : pyspark.sql.DataFrame
+            Raw source DataFrame.  Expected to be cached by the caller.
+
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            Aggregated result with columns:
+                Search Engine Domain | Search Keyword | Revenue
+            Sorted descending by Revenue.
+
+        ⚠ DESIGN CHOICE — IP as session proxy:
+        IP address is used to link search touchpoints to purchases because
+        the source data has no explicit session ID or visitor ID column.
+        LIMITATION: multiple visitors behind the same NAT/corporate proxy
+        share the same IP. Their sessions can be conflated — a search by
+        one person could be attributed to another person's purchase.
+        IMPROVEMENT: if a visitor/session ID becomes available in the data,
+        use that instead of IP for more accurate attribution.
+
+        ⚠ DESIGN CHOICE — Last-touch only:
+        The most recent search click gets 100% of the revenue credit.
+        First-touch, linear, and data-driven attribution models are not
+        implemented. Each would require a different window/aggregation approach.
+        """
+        # GUARD: check required columns exist BEFORE doing any expensive work.
+        # Fail fast with a clear message rather than getting a cryptic Spark
+        # error 3 minutes into processing.
+        required_cols = ["ip", "referrer", "event_list", "product_list", "date_time"]
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Missing required columns for business processing: {missing}"
+            )
+
+        # ---- Base enrichment ------------------------------------------------
+        # Prepare the data before any business logic. Do all expensive operations
+        # once here — lowercase the referrer, parse the timestamp, clean the
+        # event_list — so downstream code can reuse these cheap derived columns.
+        base_df = (
+            df
+            # Parse timestamp for chronological ordering (not lexicographic).
+            # String comparison of dates is unreliable for non-padded values.
+            # "2026-9-1" would sort incorrectly vs "2026-10-01" as strings.
+            .withColumn("event_ts", F.to_timestamp(F.col("date_time")))
+
+            # Lowercase + trim referrer ONCE and reuse for all downstream extractions.
+            # More efficient than lowercasing in every operation that needs it.
+            .withColumn("referrer_lc", F.lower(F.trim(F.col("referrer"))))
+
+            # Strip ALL whitespace from event_list.
+            # Prevents "1, 2, 3" being treated differently from "1,2,3"
+            # when checking for purchase event code "1".
+            .withColumn(
+                "event_list_clean",
+                F.regexp_replace(F.coalesce(F.col("event_list"), F.lit("")), r"\s+", "")
+            )
+        )
+
+        # Extract just the domain from the full referrer URL.
+        # The regex ^(?:https?://)?([^/?#]+) handles:
+        #   "https://www.google.com/search?q=ipod" → "www.google.com"
+        #   "http://bing.com/search?q=zune"        → "bing.com"
+        #   "www.yahoo.com/search?p=music"         → "www.yahoo.com"  (no protocol)
+        base_df = base_df.withColumn(
+            "referrer_domain",
+            F.lower(
+                F.regexp_extract(F.col("referrer_lc"), r"^(?:https?://)?([^/?#]+)", 1)
+            )
+        )
+
+        # Add the four business columns by calling the static helper methods.
+        # Each method adds one column to the DataFrame and returns it.
+        base_df = self._build_search_engine_column(base_df)  # adds: search_engine_domain
+        base_df = self._build_keyword_column(base_df)        # adds: search_keyword
+
+        # Purchase detection: event code "1" means Purchase in Adobe Analytics.
+        # WHY split by comma first instead of just contains("1")?
+        # contains("1") would match event codes "10", "100", "21" — false positives.
+        # Splitting to an array and using array_contains matches ONLY the exact string "1".
+        base_df = base_df.withColumn(
+            "is_purchase",
+            F.array_contains(F.split(F.col("event_list_clean"), ","), "1")
+        )
+
+        base_df = self._build_revenue_column(base_df)  # adds: revenue
+
+        # Cache the enriched base so BOTH branches below (touchpoints and purchases)
+        # can share it. Without cache, Spark would recompute all the enrichment
+        # steps from scratch for each branch — reading S3 twice, reparsing twice.
+        enriched = base_df.cache()
+
+        try:
+            # ---- Branch A: Search touchpoints -----------------------------------
+            # All rows where a visitor arrived via a recognised external search engine.
+            # We keep only the columns needed for the join — less data to shuffle.
+            # Columns aliased with "s_" prefix to avoid naming conflicts in the join.
+            search_touchpoints = (
+                enriched
+                .filter(
+                    F.col("search_engine_domain").isNotNull()  # must be a search engine
+                    & F.col("search_keyword").isNotNull()       # must have extracted a keyword
+                    & F.col("event_ts").isNotNull()             # must have a valid timestamp
+                )
+                .select(
+                    F.col("ip").alias("s_ip"),
+                    F.col("event_ts").alias("s_time"),
+                    F.col("search_engine_domain"),
+                    F.col("search_keyword"),
+                )
+            )
+
+            # ---- Branch B: Purchase rows -----------------------------------------
+            # All rows where a purchase happened with actual revenue.
+            # Columns aliased with "p_" prefix to avoid naming conflicts.
+            purchases = (
+                enriched
+                .filter(
+                    F.col("is_purchase")               # event_list contains "1"
+                    & (F.col("revenue") > 0)           # actual revenue recorded
+                    & F.col("event_ts").isNotNull()    # valid timestamp required for ordering
+                )
+                .select(
+                    F.col("ip").alias("p_ip"),
+                    F.col("event_ts").alias("p_time"),
+                    F.col("revenue"),
+                )
+            )
+
+            # ---- Last-touch attribution via Window join --------------------------
+            # For each purchase, find ALL search touchpoints from the same IP
+            # that happened BEFORE OR AT the purchase time.
+            #
+            # Example:
+            #   Purchase:  ip=1.2.3.4, time=10:05, revenue=$540
+            #   Touchpoints for ip=1.2.3.4:
+            #     google, "ipod", time=09:50  ← before purchase ✓ included in join
+            #     bing,   "nano", time=10:02  ← before purchase ✓ included in join
+            #     yahoo,  "music",time=10:06  ← AFTER purchase  ✗ excluded by condition
+            #
+            # WHY left join instead of inner join?
+            # Left join keeps all purchases even if they have no search touchpoint.
+            # Those purchases get null for search_engine_domain and are dropped
+            # in the filter below. More explicit than inner join — you can see
+            # in the data that unattributed purchases exist.
+            joined = purchases.join(
+                search_touchpoints,
+                (purchases["p_ip"] == search_touchpoints["s_ip"])
+                & (search_touchpoints["s_time"] <= purchases["p_time"]),
+                "left",
+            )
+
+            # ---- Window function: pick most recent touchpoint per purchase --------
+            # After the join, one purchase may match MULTIPLE touchpoints.
+            # Example continuing from above: the $540 purchase matches both
+            # the google "ipod" touchpoint (09:50) and the bing "nano" touchpoint (10:02).
+            # We want only the MOST RECENT one (last-touch) = bing "nano" at 10:02.
+            #
+            # Window.partitionBy: groups rows by purchase identity
+            #   (IP + purchase time + revenue uniquely identifies a purchase)
+            # .orderBy(s_time.desc()): within each group, newest touchpoint first
+            # row_number(): assigns 1 to the newest, 2 to next, etc.
+            # filter(rn == 1): keep only the most recent touchpoint per purchase
+            window_spec = (
+                Window
+                .partitionBy("p_ip", "p_time", "revenue")
+                .orderBy(F.col("s_time").desc())  # newest touchpoint first
+            )
+
+            result = (
+                joined
+                .withColumn("rn", F.row_number().over(window_spec))
+                .filter(F.col("rn") == 1)                              # keep most recent only
+                .filter(F.col("search_engine_domain").isNotNull())     # drop unattributed purchases
+                .groupBy(
+                    F.col("search_engine_domain").alias("Search Engine Domain"),
+                    F.col("search_keyword").alias("Search Keyword"),
+                )
+                # round to 2 decimal places for currency display
+                .agg(F.round(F.sum("revenue"), 2).alias("Revenue"))
+                .orderBy(F.desc("Revenue"))  # highest revenue first
+            )
+
+        finally:
+            # ALWAYS release the enriched cache, even if an exception occurs.
+            # Without this, a failed transform would leave a cached DataFrame
+            # consuming executor memory for the rest of the job's life, causing
+            # memory pressure or OOM on workers.
+            # try/finally guarantees unpersist() runs regardless of success or failure.
+            enriched.unpersist()
+
+        return result
+
+
+# ============================================================
+# BLOCK 9 — MAIN PIPELINE ORCHESTRATOR
+# ============================================================
+# main() is the conductor — it calls all the pieces in the right order.
+# It receives the pre-built S3 keys dictionary so it does not need to
+# generate any paths itself (they were built once before this function
+# was called — see the entry point section below).
+#
+# Each step is clearly commented with its purpose so if something fails
+# you can immediately tell which step it was in from the CloudWatch logs.
+# ============================================================
+def main(keys: dict):
+    log(f"Starting Glue job — input: s3://{BUCKET}/{INPUT_KEY}")
+    log(f"Config file: {CONFIG_FILE}")
+
+    source_path = f"s3://{BUCKET}/{INPUT_KEY}"
+
+    # ------------------------------------------------------------------
+    # Step 0: Checksum — skip unchanged source files (idempotency guard)
+    #
+    # WHAT IS IDEMPOTENCY?
+    # Running the same pipeline twice on the same input produces the same
+    # output without side effects. The checksum guard enforces this by
+    # remembering which files have already been processed.
+    #
+    # HOW IT WORKS:
+    # 1. Compute SHA-256 of the source file (content-based, not name-based)
+    # 2. Look for checksums/<sha256>.json in S3
+    # 3. If found AND --force is not set → skip processing, write SKIPPED summary
+    # 4. If found AND --force is set → log WARNING, reprocess anyway
+    # 5. If not found → proceed with full pipeline
+    #
+    # WHY CONTENT-BASED (SHA-256) INSTEAD OF NAME-BASED?
+    # A file with new content at the same S3 path gets a different hash
+    # and is processed as a new file. A renamed file with the same content
+    # produces the same hash and is correctly skipped.
+    # ------------------------------------------------------------------
+    checksum = compute_checksum(BUCKET, INPUT_KEY)
+    checksum_key = f"{CHECKSUMS_PREFIX}{checksum}.json"
+    log(f"Source SHA-256 checksum: {checksum}")
+    log(f"Force-reprocess flag   : {FORCE_REPROCESS}")
+
+    already_processed = checksum_exists(checksum_key)
+
+    if already_processed and not FORCE_REPROCESS:
+        # File was already processed and --force is not set — skip everything.
+        # Write a SKIPPED summary so the run is still traceable in S3 logs.
+        skipped_summary = {
+            "status": "SKIPPED_NO_CHANGE",
+            "source_bucket": BUCKET,
+            "source_key": INPUT_KEY,
+            "checksum": checksum,
+            "checksum_registry_key": checksum_key,
+            "hint": "Pass --force true to reprocess this file regardless.",
+            # ⚠ datetime.utcnow() deprecated — FIX: datetime.now(timezone.utc).isoformat()
+            "processed_at_utc": datetime.utcnow().isoformat(),
+        }
+        upload_json(keys["summary_key"], skipped_summary)
+        log(
+            f"Pipeline skipped — checksum already registered at "
+            f"s3://{BUCKET}/{checksum_key}. Pass --force true to reprocess."
+        )
+        upload_text(keys["pipeline_log_key"], "\n".join(PIPELINE_LOG_LINES))
+        job.commit()
+        return  # clean exit — not a failure
+
+    if already_processed and FORCE_REPROCESS:
+        # --force is set — log an audit trail warning before proceeding.
+        # This ensures anyone reviewing the logs can see the file was
+        # deliberately reprocessed, not accidentally triggered.
+        log(
+            f"WARNING: Checksum already registered at s3://{BUCKET}/{checksum_key} "
+            f"but --force is set — reprocessing anyway."
+        )
+
+    # ------------------------------------------------------------------
+    # Step 1: Read source file as tab-delimited text
+    #
+    # KEY READER OPTIONS AND WHY EACH ONE MATTERS:
+    #   sep="\t"       : tab-delimited — not comma (CSV is a misnomer here)
+    #   quote='"'      : fields can be wrapped in double-quotes
+    #                    needed for user_agent strings that contain commas
+    #   escape='"'     : a doubled double-quote inside a quoted field is an
+    #                    escaped quote character (standard CSV escaping)
+    #   multiLine=true : a quoted field can span multiple lines
+    #                    needed for user_agent strings with embedded newlines
+    #   encoding=UTF-8 : explicit charset prevents mojibake on special characters
+    #
+    # WHY CAST ALL COLUMNS TO STRING?
+    # Spark infers types from the data. It might decide "hit_time_gmt" is an
+    # integer and "date_time" is a timestamp. This causes the MetadataProfiler
+    # to receive non-string types which complicates the min/max/null logic.
+    # Forcing everything to string gives consistent behaviour regardless of
+    # what Spark infers.
+    #
+    # WHY df.cache() THEN df.count()?
+    # Calling cache() alone does nothing — Spark is lazy. The cache only
+    # materialises when the first action (count) is triggered. After this
+    # call, the DataFrame is held in executor memory. The profiler and
+    # the processor both read from this cache instead of re-reading S3.
+    # ------------------------------------------------------------------
+    df = (
+        spark.read
+        .option("header", "true")
+        .option("sep", "\t")
+        .option("quote", '"')
+        .option("escape", '"')
+        .option("multiLine", "true")
+        .option("encoding", "UTF-8")
+        .csv(source_path)
+    )
+
+    # Cast all columns to string for consistent metadata profiling
+    for col_name in df.columns:
+        df = df.withColumn(col_name, F.col(col_name).cast("string"))
+
+    # Cache once; shared by profiler (Step 2) and processor (Step 3).
+    # The count() call materialises the cache — without an action, caching is lazy.
+    df = df.cache()
+    source_row_count = df.count()
+
+    log(f"Source file read successfully. Columns: {len(df.columns)}, Rows: {source_row_count}")
+
+    # ------------------------------------------------------------------
+    # Step 2: Metadata profiling
+    #
+    # Validates the source file schema against metadata_config.json and
+    # computes column statistics. Writes a JSON report to S3.
+    #
+    # The pipeline continues even if mismatches are detected — they are
+    # logged as warnings, not fatal errors.
+    #
+    # ⚠ DESIGN CHOICE: whether to halt on schema mismatch depends on your
+    # data quality requirements. For strict pipelines, raise an exception
+    # here if metadata_report["metadata_mismatch"] is True.
+    # ------------------------------------------------------------------
+    config = load_metadata_config(CONFIG_FILE)
+    profiler = MetadataProfiler(config.get("expected_columns", []))
+    metadata_report = profiler.profile(df, INPUT_KEY)
+    upload_json(keys["metadata_key"], metadata_report)
+    log(f"Metadata report written → s3://{BUCKET}/{keys['metadata_key']}")
+
+    if metadata_report["metadata_mismatch"]:
+        log(f"WARNING: Schema mismatches detected: {metadata_report['metadata_mismatch_details']}")
+
+    # ------------------------------------------------------------------
+    # Step 3: Business transformation
+    #
+    # Runs the full search keyword revenue attribution pipeline.
+    # Returns a small aggregated DataFrame (one row per domain+keyword combination).
+    # Cached immediately so the count() below doesn't re-trigger the transform.
+    #
+    # df is unpersisted after this step — it is no longer needed.
+    # The processor's transform() also internally unpersists the enriched
+    # intermediate cache (see the try/finally in transform()).
+    # ------------------------------------------------------------------
+    processor = SearchKeywordRevenueProcessor()
+    result_df = processor.transform(df).cache()
+    output_row_count = result_df.count()
+    log(f"Business transformation complete. Output rows: {output_row_count}")
+
+    # Release source cache — no longer needed after transform completes.
+    # Frees executor memory for the write step below.
+    df.unpersist()
+
+    # ------------------------------------------------------------------
+    # Step 4: Write output
+    #
+    # WHY coalesce(1)?
+    # Spark writes output as a folder of multiple part files by default.
+    # The requirement is one single named .tab file.
+    # coalesce(1) forces all data through one executor producing one part file.
+    # consolidate_output() then renames it to the final destination.
+    #
+    # ⚠ SCALABILITY LIMITATION:
+    # coalesce(1) is a bottleneck for files > ~2 GB because all data must
+    # funnel through a single executor — you lose all parallelism at write time.
+    # For 10 GB+ files:
+    #   1. Remove coalesce(1) — Spark writes multiple part files
+    #   2. Use S3 Batch Operations or a post-job Lambda to rename/merge the parts
+    #   3. Remove the consolidate_output() call as it is no longer needed
+    #
+    # mode("overwrite"): if the temp prefix already has files (e.g. from a
+    # previous failed run), Spark deletes them and rewrites. This is intentional
+    # for the temp folder — it guarantees a clean write each time.
+    # ------------------------------------------------------------------
+    temp_output_s3 = f"s3://{BUCKET}/{keys['temp_output_prefix']}"
+
+    (
+        result_df.coalesce(1)  # ⚠ bottleneck for large files — see note above
+        .write
+        .mode("overwrite")
+        .option("header", "true")
+        .option("sep", "\t")
+        .csv(temp_output_s3)
+    )
+
+    result_df.unpersist()  # release cache — no longer needed after write
+
+    # Rename the Spark part file to the final named .tab file
+    consolidate_output(keys["temp_output_prefix"], keys["output_key"])
+    log(f"Final output written → s3://{BUCKET}/{keys['output_key']}")
+
+    # ------------------------------------------------------------------
+    # Step 5: Register checksum
+    #
+    # Writes the checksum record to S3 so future runs of the same file
+    # are recognised and skipped (unless --force is passed).
+    # Also records which output and metadata files were produced by this run.
+    #
+    # WHY AFTER writing the output (Step 4) and not before?
+    # If we registered the checksum before writing the output and then crashed,
+    # future runs would skip the file even though no output was produced.
+    # Registering after the output write means:
+    #   - crash before output → no checksum → next run reprocesses ✓
+    #   - crash after output but before checksum → no checksum → next run
+    #     reprocesses and overwrites the output (safe — same input = same output) ✓
+    # ------------------------------------------------------------------
+    upload_json(checksum_key, {
+        "checksum": checksum,
+        "source_bucket": BUCKET,
+        "source_key": INPUT_KEY,
+        "output_key": keys["output_key"],
+        "metadata_key": keys["metadata_key"],
+        # ⚠ datetime.utcnow() deprecated — FIX: datetime.now(timezone.utc).isoformat()
+        "first_processed_at_utc": datetime.utcnow().isoformat(),
+    })
+
+    # ------------------------------------------------------------------
+    # Step 6: Write run summary
+    #
+    # A machine-readable JSON record of what happened in this run.
+    # Used by monitoring systems and the reprocessing utility to understand
+    # what was processed and where the output landed.
+    # ------------------------------------------------------------------
+    summary = {
+        "status": "SUCCESS",
+        "source_bucket": BUCKET,
+        "source_key": INPUT_KEY,
+        "checksum": checksum,
+        "records_processed": source_row_count,
+        "output_rows": output_row_count,
+        # ⚠ datetime.utcnow() deprecated — FIX: datetime.now(timezone.utc).isoformat()
+        "processed_at_utc": datetime.utcnow().isoformat(),
+    }
+    upload_json(keys["summary_key"], summary)
+
+    # ------------------------------------------------------------------
+    # Step 7: Flush pipeline log to S3
+    #
+    # All log() calls during the run accumulated in PIPELINE_LOG_LINES.
+    # Here we join them and write the complete log to S3 as a plain text file.
+    # This gives a permanent record even after CloudWatch log retention expires.
+    # ------------------------------------------------------------------
+    log("Glue pipeline completed successfully.")
+    upload_text(keys["pipeline_log_key"], "\n".join(PIPELINE_LOG_LINES))
+
+    # job.commit() is required by Glue to mark the run as officially complete.
+    # Without this, Glue may not update the job bookmark state correctly.
+    job.commit()
+
+
+# ============================================================
+# BLOCK 10 — ENTRY POINT
+# ============================================================
+# This is where the script actually starts executing (Python runs top-to-bottom).
+# Everything above has been definitions — classes, functions, constants.
+# This block is the "go" button.
+#
+# WHY build_s3_keys() IS CALLED HERE (NOT INSIDE main()):
+# Both main() and the error handler need the same S3 paths. If build_s3_keys()
+# were called inside main() AND again inside the except block, the second call
+# would produce a new timestamp and the FAILED summary would land in completely
+# different S3 locations than the run used. You would never find your error logs.
+# Building once here and passing _run_keys everywhere ensures consistency.
+#
+# THE ERROR HANDLER STRUCTURE:
+# Outer try/except: catches ANY unhandled exception from main()
+#   → logs the error
+#   → tries to write FAILED summary and log to S3
+#   → re-raises the original exception
+#
+# WHY re-raise at the end?
+# Without raise, Glue sees the except block completed and marks the job as
+# SUCCEEDED even though it failed. The bare raise ensures Glue marks it FAILED.
+#
+# Inner try/except around the log upload:
+# The log upload itself might fail (e.g. S3 is down, permissions issue).
+# If we let that exception propagate it would REPLACE the original exception
+# in the traceback — making it very hard to diagnose the real cause.
+# The bare "except Exception: pass" catches the secondary failure silently
+# and lets the original exception propagate cleanly via the outer raise.
+#
+# ⚠ LIMITATION:
+# build_s3_keys() itself is OUTSIDE the try/except. In its current form it
+# is unlikely to fail (just string formatting and a datetime call). However,
+# if someone later adds an S3 call or config read inside build_s3_keys(), a
+# failure there would produce no FAILED summary and no error log in S3.
+# IMPROVEMENT: wrap the entire entry point (including build_s3_keys()) in
+# the try/except block:
+#
+#   try:
+#       _run_keys = build_s3_keys(INPUT_KEY)   ← move inside try
+#       main(_run_keys)
+#   except Exception as exc:
+#       ...
+# ============================================================
+_run_keys = build_s3_keys(INPUT_KEY)  # ⚠ outside try/except — see note above
+
+try:
+    main(_run_keys)
+except Exception as exc:
+    error_text = str(exc)
+    log(f"Pipeline FAILED: {error_text}")
+
+    try:
+        # Best-effort: try to write the FAILED summary and log.
+        # If this also fails (e.g. S3 is down) we catch it silently
+        # so it does not mask the original exception below.
+        upload_json(_run_keys["summary_key"], {
+            "status": "FAILED",
+            "source_bucket": BUCKET,
+            "source_key": INPUT_KEY,
+            "error": error_text,
+            # ⚠ datetime.utcnow() deprecated — FIX: datetime.now(timezone.utc).isoformat()
+            "processed_at_utc": datetime.utcnow().isoformat(),
+        })
+        upload_text(_run_keys["pipeline_log_key"], "\n".join(PIPELINE_LOG_LINES))
+    except Exception:
+        pass  # Best-effort log upload; do not mask the original error
+
+    raise  # ← re-raise so Glue marks this run as FAILED (not SUCCEEDED)
